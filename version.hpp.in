@@ -1,0 +1,6 @@
+#pragma once
+
+namespace ts_extra_utilities
+{
+    constexpr const char* VERSION = "@PLUGIN_VERSION_MAJOR@.@PLUGIN_VERSION_MINOR@.@PLUGIN_VERSION_PATCH@";
+}
