@@ -16,7 +16,7 @@ namespace ts_extra_utilities
         if (
             const auto res = MH_CreateHook( reinterpret_cast< LPVOID >( this->original_address_ ),
                                             reinterpret_cast< LPVOID >( this->hk_address_ ),
-                                            reinterpret_cast< LPVOID* >( this->original_fn_ ) );
+                                            reinterpret_cast< LPVOID* >( &this->original_fn_ ) );
             res != MH_OK && res != MH_ERROR_ALREADY_CREATED )
         {
             CCore::g_instance->error( "Could not create '{}' hook: {}", this->name_, static_cast< int32_t >( res ) );
