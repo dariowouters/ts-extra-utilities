@@ -123,13 +123,13 @@ namespace ts_extra_utilities
 
         const auto d3d11_create_device_and_swap_chain = reinterpret_cast< D3D11CreateDeviceAndSwapChain_fnt* >( D3D11CreateDeviceAndSwapChain_address );
 
-        const auto hr = d3d11_create_device_and_swap_chain( nullptr, D3D_DRIVER_TYPE_REFERENCE, nullptr, 0, feature_levels, 2, D3D11_SDK_VERSION, &swap_chain_desc, &dummy_swap_chain, &dummy_device, &feature_level, &dummy_context );
+        const auto hr = d3d11_create_device_and_swap_chain( nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, feature_levels, 2, D3D11_SDK_VERSION, &swap_chain_desc, &dummy_swap_chain, &dummy_device, &feature_level, &dummy_context );
 
         if ( FAILED( hr ) )
         {
             DestroyWindow( hwnd );
             UnregisterClass( window_class.lpszClassName, window_class.hInstance );
-            CCore::g_instance->error( "Could not create dx11 device and swap chain" );
+            CCore::g_instance->error( "Could not create dx11 device and swap chain (hresult = 0x{:x})", static_cast< uint32_t >( hr ) );
             return false;
         }
 
