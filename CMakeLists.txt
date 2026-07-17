@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(ts-extra-utilities VERSION 1.0.1)
+project(ts-extra-utilities VERSION 1.0.2)
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
@@ -7,7 +7,9 @@ file(GLOB_RECURSE ${CMAKE_PROJECT_NAME}-src src/*.hpp src/*.cpp)
 
 set(PLUGIN_VERSION_MAJOR 1)
 set(PLUGIN_VERSION_MINOR 0)
-set(PLUGIN_VERSION_PATCH 1)
+set(PLUGIN_VERSION_PATCH 2)
+set(PLUGIN_TARGET_VERSION_MAJOR 1)
+set(PLUGIN_TARGET_VERSION_MINOR 59)
 
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/version.hpp.in
