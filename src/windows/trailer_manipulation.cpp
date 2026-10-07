@@ -1,330 +1,285 @@
-﻿#include "trailer_manipulation.hpp"
+#include "trailer_manipulation.hpp"
+
+#include <algorithm>
+#include <atomic>
 
 #include "imgui.h"
 
 #include "core.hpp"
 #include "hooks/function_hook.hpp"
-#include "hooks/vtable_hook.hpp"
-#include "prism/controllers/base_ctrl.hpp"
-#include "prism/game_actor.hpp"
-#include "prism/physics/physics_actor_t.hpp"
-#include "prism/vehicles/accessories/data/accessory_chassis_data.hpp"
+#include "memory/memory_utils.hpp"
+#include "prism/offsets.hpp"
+#include "settings/settings.hpp"
 
 namespace ts_extra_utilities
 {
-    struct TrailerJointState
+    constexpr uint32_t max_trailers = 20;
+
+    // Shared between the render thread (UI) and the game thread (the hook). The hook only
+    // compares the pointer, it never dereferences it, so a stale entry is harmless.
+    struct LockedSteering
     {
-        enum Enum
-        {
-            NORMAL,
-            LOCKED,
-            DISCONNECTED,
-        };
+        std::atomic< prism::vehicle_wheel_steering_data_t* > data{ nullptr };
+        std::atomic< float > angle{ 0.f };
     };
 
-    thread_local bool locked_trailers[ 20 ] = {};
+    LockedSteering locked_steering[ max_trailers ];
 
-    thread_local TrailerJointState::Enum trailer_joints[ 20 ] = {};
+    // UI-only state, render thread
+    bool locked_ui[ max_trailers ] = {};
+    float angle_ui[ max_trailers ] = {};
 
-    thread_local std::shared_ptr< CVirtualFunctionHook > steering_advance_hook = nullptr;
-    thread_local std::shared_ptr< CFunctionHook > crashes_when_disconnected_hook = nullptr;
-    thread_local std::shared_ptr< CFunctionHook > connect_slave_hook = nullptr;
-
-    /**
-     * \brief Hook for prism::physics_trailer_u::steering_advance so we can control which trailer can be steered by the game
-     * \param self /
-     * \return /
-     */
-    uint64_t hk_steering_advance( prism::physics_trailer_u* self )
-    {
-        int trailer_index = 0;
-        const auto* check_trailer = CCore::g_instance->get_game_actor()->game_trailer_actor;
-        while ( check_trailer != nullptr && self != check_trailer )
-        {
-            check_trailer = check_trailer->slave_trailer;
-            ++trailer_index;
-        }
-
-        if ( check_trailer == nullptr || locked_trailers[ trailer_index ] == false )
-        {
-            return steering_advance_hook->get_original< prism::physics_trailer_u_steering_advance_fn >()( self );
-        }
-        return 0;
-    }
-
-    // TODO: Check what this original function actually did
-    // original function crashes when a slave trailer is disconnected due to it expecting the physics joint to exist when there is a slave trailer
-    // and the joint is not there when we have the trailer disconnected
-    void hk_crashes_when_disconnected( prism::physics_trailer_u* self, prism::game_trailer_actor_u* trailer_actor )
-    {
-        // original_crash_fn(self, trailer_actor);
-    }
+    std::shared_ptr< CFunctionHook > set_individual_steering_hook = nullptr;
 
     /**
-     * \brief Hook to stop slave trailers from getting automatically reconnected when we attach their parent
-     * \param _ unused
+     * \brief Hook for set_individual_steering, which the game calls every steering advance with the
+     * angle it computed from the joint. For a trailer the user took control of, swap in their angle.
+     *
+     * Before 1.61 this feature skipped physics_trailer_u::steering_advance entirely, but that function
+     * now also runs a per-wheel update after setting the angle, so only the angle is replaced here.
      */
-    void hk_connect_slave( prism::physics_trailer_u* _ )
+    void hk_set_individual_steering( prism::vehicle_wheel_steering_data_t* data, float angle )
     {
-        // original_connect_slave(self);
+        for ( auto& locked : locked_steering )
+        {
+            if ( data != nullptr && locked.data.load( std::memory_order_relaxed ) == data )
+            {
+                angle = locked.angle.load( std::memory_order_relaxed );
+                break;
+            }
+        }
+        set_individual_steering_hook->get_original< prism::set_individual_steering_fn >()( data, angle );
+    }
+
+    void release_all()
+    {
+        for ( uint32_t i = 0; i < max_trailers; ++i )
+        {
+            locked_steering[ i ].data.store( nullptr );
+            locked_ui[ i ] = false;
+        }
     }
 
     CTrailerManipulation::CTrailerManipulation() = default;
 
     CTrailerManipulation::~CTrailerManipulation()
     {
-        steering_advance_hook.reset();
-        crashes_when_disconnected_hook.reset();
-        connect_slave_hook.reset();
+        release_all();
+        set_individual_steering_hook.reset();
     }
 
     bool CTrailerManipulation::init()
     {
-        this->set_individual_steering_fn_ = memory::get_function_from_pattern< prism::set_individual_steering_fn >( "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec ? 8b 41 ? 48 8b d9 0f 29 74", 0 );
+        const auto address = memory::get_address_for_pattern( "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec ? 8b 41 ? 48 8b d9 0f 29 74" );
 
-        if ( this->set_individual_steering_fn_ == nullptr )
+        if ( address == 0 )
         {
             CCore::g_instance->error( "Could not find 'set_individual_steering' function" );
+            return false;
         }
-        else
+        CCore::g_instance->debug( "Found set_individual_steering function @ +{:x}", memory::as_offset( address ) );
+
+        set_individual_steering_hook = CCore::g_instance->get_hooks_manager()->register_function_hook(
+            "set_individual_steering",
+            address,
+            reinterpret_cast< uint64_t >( &hk_set_individual_steering ) );
+
+        if ( set_individual_steering_hook->hook() != CHook::HOOKED )
         {
-            CCore::g_instance->debug( "Found set_individual_steering function @ +{:x}", memory::as_offset( reinterpret_cast< uint64_t >( this->set_individual_steering_fn_ ) ) );
+            CCore::g_instance->error( "Could not hook 'set_individual_steering'" );
+            return false;
         }
-
-        const auto crash_fn_address = memory::get_address_for_pattern( "48 85 d2 0f 84 ? ? ? ? 48 89 74 24 18 57 48 83 ec 40" );
-
-        crashes_when_disconnected_hook = CCore::g_instance->get_hooks_manager()->register_function_hook(
-            "crashes_when_disconnected",
-            crash_fn_address,
-            reinterpret_cast< uint64_t >( &hk_crashes_when_disconnected ) );
-
-        if ( !CCore::g_instance->is_truckersmp() )
-        {
-            crashes_when_disconnected_hook->hook();
-        }
-
-        const auto connect_slave_address = memory::get_address_for_pattern( "40 53 48 83 ec 60 48 83 b9 ? ? ? ? 00 48 8b d9 0f 84 ? ? ? ? 48 8d 54 24 ? e8" );
-
-        connect_slave_hook = CCore::g_instance->get_hooks_manager()->register_function_hook(
-            "prism::physics_trailer_u::connect_slave",
-            connect_slave_address,
-            reinterpret_cast< uint64_t >( &hk_connect_slave ) );
-        if ( !CCore::g_instance->is_truckersmp() )
-        {
-            connect_slave_hook->create();
-        }
-
-        this->get_slave_hook_position_fn_ = reinterpret_cast< prism::physics_trailer_u_get_slave_hook_position_fn* >(
-            connect_slave_address + 29 + *reinterpret_cast< int32_t* >( connect_slave_address + 29 ) + 4 );
 
         this->valid_ = true;
         return this->valid_;
     }
 
-    void CTrailerManipulation::render_trailer_steering( prism::game_trailer_actor_u* current_trailer, uint32_t i ) const
+
+    // The current trailer chain, refreshed by update() every frame on the render thread.
+    void* trailers[ max_trailers ] = {};
+    uint32_t trailer_count = 0;
+
+    bool held[ settings::action_count ] = {};
+
+    prism::vehicle_wheel_steering_data_t* steering_data( void* trailer )
     {
-        if ( ImGui::Checkbox( "Locked##steering", &locked_trailers[ i ] ) )
+        return prism::offsets::field< prism::vehicle_wheel_steering_data_t* >( trailer, prism::offsets::trailer_steering_data );
+    }
+
+    void set_locked( const uint32_t i, const bool lock )
+    {
+        if ( locked_ui[ i ] == lock ) return;
+        locked_ui[ i ] = lock;
+        CCore::g_instance->info( "{} steering for {}", lock ? "Locking" : "Unlocking", i );
+        if ( lock )
         {
-            CCore::g_instance->info( "{} steering for {}", locked_trailers[ i ] ? "Locking" : "Unlocking", i );
+            // start from where the game had the wheels so they do not jump
+            angle_ui[ i ] = prism::offsets::field< float >( trailers[ i ], prism::offsets::trailer_steering );
+            locked_steering[ i ].angle.store( angle_ui[ i ] );
         }
-        ImGui::BeginDisabled( !locked_trailers[ i ] );
-        if ( ImGui::SliderFloat( "Angle", &current_trailer->steering, -1.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp ) )
+    }
+
+    bool game_has_focus()
+    {
+        DWORD pid = 0;
+        GetWindowThreadProcessId( GetForegroundWindow(), &pid );
+        return pid == GetCurrentProcessId();
+    }
+
+    // true while the bound key is down; first_press only on the frame it went down
+    bool key_down( const settings::Action action, bool* first_press = nullptr )
+    {
+        const auto vk = settings::key( action );
+        const bool down = vk != 0 && ( GetAsyncKeyState( static_cast< int >( vk ) ) & 0x8000 ) != 0;
+        bool& was = held[ static_cast< int >( action ) ];
+        if ( first_press != nullptr ) *first_press = down && !was;
+        was = down;
+        return down;
+    }
+
+    void CTrailerManipulation::update( const float dt )
+    {
+        if ( !this->valid_ ) return;
+
+        auto* game_actor = CCore::g_instance->get_game_actor();
+        void* trailer = game_actor == nullptr ? nullptr : prism::offsets::field< void* >( game_actor, prism::offsets::game_actor_trailer );
+
+        trailer_count = 0;
+        for ( ; trailer != nullptr && trailer_count < max_trailers; ++trailer_count )
         {
-            CCore::g_instance->info( "Changed steering angle for trailer {} to {}", i, current_trailer->steering );
-            this->set_individual_steering_fn_( current_trailer->wheel_steering_stuff, current_trailer->steering );
+            trailers[ trailer_count ] = trailer;
+            trailer = prism::offsets::field< void* >( trailer, prism::offsets::trailer_slave );
         }
+
+        // nothing to steer on a trailer without steerable wheels, or one that is gone
+        for ( uint32_t i = 0; i < max_trailers; ++i )
+        {
+            if ( i >= trailer_count || steering_data( trailers[ i ] ) == nullptr )
+            {
+                locked_ui[ i ] = false;
+            }
+        }
+
+        // hotkeys, ignored while the game is in the background or a key is being rebound
+        if ( game_has_focus() && !settings::is_capturing() )
+        {
+            bool lock_pressed = false, center_pressed = false;
+            key_down( settings::Action::TOGGLE_STEERING_LOCK, &lock_pressed );
+            key_down( settings::Action::STEER_CENTER, &center_pressed );
+            const bool left = key_down( settings::Action::STEER_LEFT );
+            const bool right = key_down( settings::Action::STEER_RIGHT );
+
+            bool any_locked = false;
+            for ( uint32_t i = 0; i < trailer_count; ++i ) any_locked |= locked_ui[ i ];
+
+            for ( uint32_t i = 0; i < trailer_count; ++i )
+            {
+                if ( steering_data( trailers[ i ] ) == nullptr ) continue;
+
+                if ( lock_pressed )
+                {
+                    set_locked( i, !any_locked );
+                }
+                else if ( left || right || center_pressed )
+                {
+                    set_locked( i, true ); // steering a trailer means taking control of it
+                }
+
+                if ( !locked_ui[ i ] ) continue;
+
+                if ( center_pressed ) angle_ui[ i ] = 0.f;
+                const float step = settings::g_settings.steering_speed * dt;
+                if ( left ) angle_ui[ i ] = ( std::max )( angle_ui[ i ] - step, -1.f );
+                if ( right ) angle_ui[ i ] = ( std::min )( angle_ui[ i ] + step, 1.f );
+                locked_steering[ i ].angle.store( angle_ui[ i ] );
+            }
+        }
+
+        // Published every frame: the data pointer changes when trailers are swapped.
+        for ( uint32_t i = 0; i < max_trailers; ++i )
+        {
+            locked_steering[ i ].data.store( locked_ui[ i ] ? steering_data( trailers[ i ] ) : nullptr );
+            if ( i < trailer_count && !locked_ui[ i ] )
+            {
+                angle_ui[ i ] = prism::offsets::field< float >( trailers[ i ], prism::offsets::trailer_steering );
+            }
+        }
+    }
+
+    void CTrailerManipulation::render_trailer_steering( const uint32_t i ) const
+    {
+        bool lock = locked_ui[ i ];
+        if ( ImGui::Checkbox( "Locked##steering", &lock ) )
+        {
+            set_locked( i, lock );
+        }
+
+        ImGui::BeginDisabled( !locked_ui[ i ] );
+        bool changed = ImGui::SliderFloat( "Angle", &angle_ui[ i ], -1.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp );
 
         ImGui::PushItemFlag( ImGuiItemFlags_ButtonRepeat, true );
 
         if ( ImGui::ArrowButton( "rotate_left", ImGuiDir_Left ) )
         {
-            current_trailer->steering -= 0.02f;
-            if ( current_trailer->steering < -1.f )
-            {
-                current_trailer->steering = -1.f;
-            }
-            this->set_individual_steering_fn_( current_trailer->wheel_steering_stuff, current_trailer->steering );
+            angle_ui[ i ] = ( std::max )( angle_ui[ i ] - 0.02f, -1.f );
+            changed = true;
         }
         ImGui::SameLine();
         if ( ImGui::Button( "center" ) )
         {
-            current_trailer->steering = 0.f;
-            this->set_individual_steering_fn_( current_trailer->wheel_steering_stuff, current_trailer->steering );
+            angle_ui[ i ] = 0.f;
+            changed = true;
         }
         ImGui::SameLine();
-
         if ( ImGui::ArrowButton( "rotate_right", ImGuiDir_Right ) )
         {
-            current_trailer->steering += 0.02f;
-            if ( current_trailer->steering > 1.f )
-            {
-                current_trailer->steering = 1.f;
-            }
-            this->set_individual_steering_fn_( current_trailer->wheel_steering_stuff, current_trailer->steering );
+            angle_ui[ i ] = ( std::min )( angle_ui[ i ] + 0.02f, 1.f );
+            changed = true;
         }
 
         ImGui::PopItemFlag();
-
         ImGui::EndDisabled();
-    }
 
-    void CTrailerManipulation::connect_trailer( prism::game_trailer_actor_u* current_trailer, const uint32_t i ) const
-    {
-        // disable the function that automatically connects slave trailers
-        if ( connect_slave_hook->hook() != CHook::HOOKED )
+        if ( changed )
         {
-            CCore::g_instance->error( "Could not enable 'connect_slave' hook in 'connect_trailer'" );
-            return;
+            // applied by the game's next steering advance, on its own thread
+            locked_steering[ i ].angle.store( angle_ui[ i ] );
         }
-        auto* last_connected_trailer = CCore::g_instance->get_game_actor()->get_last_trailer_connected_to_truck();
-
-        if ( last_connected_trailer == nullptr )
-        {
-            auto* truck = CCore::g_instance->get_game_actor()->game_physics_vehicle;
-            const float3_t vec{
-                truck->accessory_chassis_data->hook_position.x - truck->hook_locator.x,
-                truck->accessory_chassis_data->hook_position.y - truck->hook_locator.y,
-                truck->accessory_chassis_data->hook_position.z - truck->hook_locator.z
-            };
-            current_trailer->connect( truck, vec, 0, true, false );
-            current_trailer->set_trailer_brace( false );
-        }
-        else
-        {
-            float3_t slave_hook_position{};
-            get_slave_hook_position_fn_( last_connected_trailer, &slave_hook_position );
-            const float3_t vec{
-                slave_hook_position.x - last_connected_trailer->hook_locator.x,
-                slave_hook_position.y - last_connected_trailer->hook_locator.y,
-                slave_hook_position.z - last_connected_trailer->hook_locator.z
-            };
-            current_trailer->connect( last_connected_trailer, vec, 0, true, false );
-            current_trailer->set_trailer_brace( false );
-        }
-
-        if ( connect_slave_hook->unhook() != CHook::CREATED )
-        {
-            CCore::g_instance->error( "Could not disable 'connect_slave' hook in 'connect_trailer'" );
-        }
-    }
-
-    void CTrailerManipulation::render_trailer_joint( prism::game_trailer_actor_u* current_trailer, const uint32_t i ) const
-    {
-        ImGui::SeparatorText( "Joint" );
-        if ( CCore::g_instance->get_base_ctrl_instance()->selected_physics_engine == 1 ) // PhysX
-        {
-            if ( current_trailer->physics_joint != nullptr && current_trailer->physics_joint->px_joint != nullptr )
-            {
-                if ( ImGui::RadioButton( "Unlocked##joint", trailer_joints[ i ] == TrailerJointState::NORMAL ) )
-                {
-                    if ( trailer_joints[ i ] == TrailerJointState::DISCONNECTED )
-                    {
-                        this->connect_trailer( current_trailer, i );
-                    }
-
-                    trailer_joints[ i ] = TrailerJointState::NORMAL;
-                    current_trailer->physics_joint->px_joint->setMotion( physx::PxD6Axis::eTWIST, physx::PxD6Motion::eFREE );
-                }
-                ImGui::SameLine();
-                if ( ImGui::RadioButton( "Locked##joint", trailer_joints[ i ] == TrailerJointState::LOCKED ) )
-                {
-                    if ( trailer_joints[ i ] == TrailerJointState::DISCONNECTED )
-                    {
-                        this->connect_trailer( current_trailer, i );
-                    }
-
-                    trailer_joints[ i ] = TrailerJointState::LOCKED;
-                    current_trailer->physics_joint->px_joint->setMotion( physx::PxD6Axis::eTWIST, physx::PxD6Motion::eLOCKED );
-                }
-            }
-        }
-        else
-        {
-            ImGui::TextWrapped( "Ability to lock joints is only available with PhysX" );
-        }
-
-        ImGui::SeparatorText( "Connect/Disconnect" );
-        // nothing in this plugin is recommended to be used in TruckersMP but this is completely broken when used in TruckersMP and WILL get you banned, so I've explicitly disabled it.
-        if ( !CCore::g_instance->is_truckersmp() )
-        {
-            ImGui::BeginDisabled( current_trailer->physics_joint != nullptr );
-            if ( ImGui::Button( "Connect##trailer" ) )
-            {
-                this->connect_trailer( current_trailer, i );
-                trailer_joints[ i ] = TrailerJointState::NORMAL;
-            }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::BeginDisabled( current_trailer->physics_joint == nullptr );
-            if ( ImGui::Button( "Disconnect##trailer" ) )
-            {
-                current_trailer->set_trailer_brace( true );
-                current_trailer->disconnect();
-                trailer_joints[ i ] = TrailerJointState::DISCONNECTED;
-            }
-            ImGui::EndDisabled();
-        }
-        else
-        {
-            ImGui::TextWrapped( "Individually detachable trailers does not work in TruckersMP" );
-        }
-    }
-
-    void CTrailerManipulation::render_trailers() const
-    {
-        if (
-            CCore::g_instance->get_game_actor() == nullptr ||
-            CCore::g_instance->get_game_actor()->game_trailer_actor == nullptr )
-        {
-            ImGui::Text( "No trailers found" );
-            return;
-        }
-
-        auto* current_trailer = CCore::g_instance->get_game_actor()->game_trailer_actor;
-
-        if ( steering_advance_hook == nullptr )
-        {
-            const auto steering_advance_address = *reinterpret_cast< uint64_t* >( current_trailer ) + 0x08 * 73;
-            steering_advance_hook = CCore::g_instance->get_hooks_manager()->register_virtual_function_hook(
-                "physics_trailer_u::steering_advance",
-                steering_advance_address,
-                reinterpret_cast< uint64_t >( &hk_steering_advance )
-            );
-
-
-            if ( steering_advance_hook->hook() != CHook::HOOKED )
-            {
-                CCore::g_instance->error( "Could not hook the physics_trailer_u::steering_advance virtual function" );
-            }
-        }
-
-        int i = 0;
-        do
-        {
-            const auto trailer_name = fmt::format( "Trailer {}", i );
-            ImGui::PushID( trailer_name.c_str() );
-            if ( ImGui::CollapsingHeader( trailer_name.c_str(), ImGuiTreeNodeFlags_DefaultOpen ) )
-            {
-                if ( current_trailer->wheel_steering_stuff != nullptr && set_individual_steering_fn_ != nullptr )
-                {
-                    ImGui::SeparatorText( "Steering" );
-                    this->render_trailer_steering( current_trailer, i );
-                }
-                this->render_trailer_joint( current_trailer, i );
-            }
-            ImGui::PopID();
-
-            current_trailer = current_trailer->slave_trailer;
-            ++i;
-        }
-        while ( current_trailer != nullptr );
     }
 
     void CTrailerManipulation::render()
     {
-        ImGui::Begin( "Trailer Manipulation"/*, &this->open_ */ );
+        ImGui::Begin( "Trailer Manipulation" );
 
-        this->render_trailers();
+        if ( !this->valid_ )
+        {
+            ImGui::TextWrapped( "Trailer steering is unavailable for this game version, see the game log." );
+        }
+        else if ( trailer_count == 0 )
+        {
+            ImGui::Text( "No trailers found" );
+        }
+        else
+        {
+            for ( uint32_t i = 0; i < trailer_count; ++i )
+            {
+                const auto trailer_name = fmt::format( "Trailer {}", i );
+                ImGui::PushID( trailer_name.c_str() );
+                if ( ImGui::CollapsingHeader( trailer_name.c_str(), ImGuiTreeNodeFlags_DefaultOpen ) )
+                {
+                    if ( steering_data( trailers[ i ] ) != nullptr )
+                    {
+                        ImGui::SeparatorText( "Steering" );
+                        this->render_trailer_steering( i );
+                    }
+                    else
+                    {
+                        ImGui::TextWrapped( "No steerable wheels" );
+                    }
+                }
+                ImGui::PopID();
+            }
+        }
 
         ImGui::End();
     }

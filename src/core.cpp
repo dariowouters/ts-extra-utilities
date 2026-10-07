@@ -10,6 +10,8 @@
 
 #include "managers/window_manager.hpp"
 #include "windows/trailer_manipulation.hpp"
+#include "windows/keybinds.hpp"
+#include "settings/settings.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler( HWND, UINT, WPARAM, LPARAM );
 
@@ -48,12 +50,16 @@ namespace ts_extra_utilities
             return false;
         }
 
-        const auto trailer_manipulation = this->window_manager_->register_window( std::make_shared< CTrailerManipulation >() );
+        settings::load();
 
-        if ( !trailer_manipulation->init() )
+        this->trailer_manipulation_ = this->window_manager_->register_window( std::make_shared< CTrailerManipulation >() );
+
+        if ( !this->trailer_manipulation_->init() )
         {
             g_instance->error( "Could not initialize the trailer manipulation module" );
         }
+
+        this->window_manager_->register_window( std::make_shared< CKeybinds >() )->init();
 
         return true;
     }
@@ -88,6 +94,11 @@ namespace ts_extra_utilities
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+
+        if ( this->trailer_manipulation_ != nullptr )
+        {
+            this->trailer_manipulation_->update( ImGui::GetIO().DeltaTime );
+        }
 
         if ( this->render_ui )
         {
@@ -128,19 +139,25 @@ namespace ts_extra_utilities
         this->render_ui = !this->render_ui;
     }
 
-    // TODO: add keybind settings
     bool CCore::on_wnd_proc( HWND hwnd, UINT umsg, WPARAM wparam, LPARAM lparam )
     {
-        if ( umsg == WM_KEYDOWN )
+        if ( umsg == WM_KEYDOWN || umsg == WM_SYSKEYDOWN )
         {
-            if ( wparam == VK_INSERT )
+            const auto vk = static_cast< UINT >( wparam );
+            if ( settings::capture_key( vk ) )
             {
-                toggle_input_hook();
                 return true;
             }
-            if ( wparam == VK_DELETE )
+
+            const bool repeat = ( lparam & ( 1 << 30 ) ) != 0; // held down: toggle once, not on every auto-repeat
+            if ( vk == settings::key( settings::Action::TOGGLE_CURSOR ) )
             {
-                toggle_ui();
+                if ( !repeat ) toggle_input_hook();
+                return true;
+            }
+            if ( vk == settings::key( settings::Action::TOGGLE_UI ) )
+            {
+                if ( !repeat ) toggle_ui();
                 return true;
             }
         }
@@ -162,12 +179,19 @@ namespace ts_extra_utilities
     prism::base_ctrl_u* CCore::get_base_ctrl_instance()
     {
         if ( this->base_ctrl_instance_ptr_address != 0 ) return *reinterpret_cast< prism::base_ctrl_u** >( this->base_ctrl_instance_ptr_address );
+        if ( this->base_ctrl_scan_failed_ ) return nullptr;
 
-        const auto addr = memory::get_address_for_pattern( "48 8b 05 ? ? ? ? 48 8b 4b ? 48 8b 80 ? ? ? ? 48 8b b9" );
+        // 1.61: the `cheat repair` handler loads the game singleton and its game_actor back to back
+        const auto addr = memory::get_address_for_pattern( "48 8b 3d ? ? ? ? 48 8b bf ? ? ? ? 48 8b 5f 18 48 8b 9b" );
 
-        if ( addr == 0 ) return nullptr;
+        if ( addr == 0 )
+        {
+            this->base_ctrl_scan_failed_ = true;
+            this->error( "Could not find base_ctrl, trailer steering is unavailable" );
+            return nullptr;
+        }
         this->base_ctrl_instance_ptr_address = addr + *reinterpret_cast< int32_t* >( addr + 3 ) + 7;
-        this->game_actor_offset_in_base_ctrl = *reinterpret_cast< int32_t* >( addr + 14 );
+        this->game_actor_offset_in_base_ctrl = *reinterpret_cast< int32_t* >( addr + 10 );
 
         this->info( "Found base_ctrl @ +{:x}", memory::as_offset( this->base_ctrl_instance_ptr_address ) );
 

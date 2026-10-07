@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include <dinput.h>
+#include <memory>
 
 #include "scssdk_telemetry.h"
 #include "fmt/core.h"
@@ -11,6 +12,7 @@
 namespace ts_extra_utilities
 {
     class CWindowManager;
+    class CTrailerManipulation;
 
     namespace prism
     {
@@ -34,6 +36,8 @@ namespace ts_extra_utilities
         float last_mouse_pos_y_ = 500;
 
         uint64_t base_ctrl_instance_ptr_address = 0;
+        bool base_ctrl_scan_failed_ = false; // looked up every frame, so never rescan the exe after a miss
+        std::shared_ptr< CTrailerManipulation > trailer_manipulation_ = nullptr;
         uint32_t game_actor_offset_in_base_ctrl = 0;
 
         bool truckersmp_ = false;

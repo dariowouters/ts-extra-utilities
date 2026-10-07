@@ -2,5 +2,5 @@
 
 namespace ts_extra_utilities
 {
-    constexpr const char* VERSION = "1.0.1";
+    constexpr const char* VERSION = "1.2.0";
 }

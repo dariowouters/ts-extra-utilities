@@ -2,11 +2,12 @@
 
 #include <Windows.h>
 #include <d3d11.h>
+#include <dxgi1_2.h>
 
 #include "imgui.h"
 
 #include "core.hpp"
-#include "hooks/vtable_hook.hpp"
+#include "hooks/function_hook.hpp"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 
@@ -14,8 +15,10 @@ namespace ts_extra_utilities
 {
     using D3D11CreateDeviceAndSwapChain_fnt = decltype(D3D11CreateDeviceAndSwapChain);
     using present_fn = HRESULT __stdcall( IDXGISwapChain*, UINT, UINT );
+    using present1_fn = HRESULT __stdcall( IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS* );
 
-    std::shared_ptr< CVirtualFunctionHook > present_hook = nullptr;
+    std::shared_ptr< CFunctionHook > present_hook = nullptr;
+    std::shared_ptr< CFunctionHook > present1_hook = nullptr;
 
     bool imgui_initialized;
 
@@ -30,8 +33,17 @@ namespace ts_extra_utilities
         return CallWindowProc( original_wndproc, hwnd, umsg, wparam, lparam );
     }
 
-    HRESULT hk_present( IDXGISwapChain* swap_chain, const UINT sync_interval, const UINT flags )
+    // Shared by the Present and Present1 hooks. The depth counter keeps a frame from being
+    // drawn twice should one of them be implemented by calling the other.
+    thread_local int present_depth = 0;
+
+    void on_present( IDXGISwapChain* swap_chain )
     {
+        if ( present_depth++ != 0 )
+        {
+            return;
+        }
+
         if ( !imgui_initialized )
         {
             if ( SUCCEEDED( swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device)) ) )
@@ -51,12 +63,31 @@ namespace ts_extra_utilities
                     SetWindowLongPtr( prism_hwnd, GWLP_WNDPROC, reinterpret_cast< LONG_PTR >( WndProcD3D ) )
                 );
                 imgui_initialized = true;
+                CCore::g_instance->info( "Present hook is live, overlay initialized" );
             }
         }
 
-        CCore::g_instance->render();
+        // not a D3D11 swapchain otherwise, nothing to draw with
+        if ( imgui_initialized )
+        {
+            CCore::g_instance->render();
+        }
+    }
 
-        return present_hook->get_original< present_fn >()( swap_chain, sync_interval, flags );
+    HRESULT hk_present( IDXGISwapChain* swap_chain, const UINT sync_interval, const UINT flags )
+    {
+        on_present( swap_chain );
+        const auto hr = present_hook->get_original< present_fn >()( swap_chain, sync_interval, flags );
+        --present_depth;
+        return hr;
+    }
+
+    HRESULT hk_present1( IDXGISwapChain1* swap_chain, const UINT sync_interval, const UINT flags, const DXGI_PRESENT_PARAMETERS* params )
+    {
+        on_present( swap_chain );
+        const auto hr = present1_hook->get_original< present1_fn >()( swap_chain, sync_interval, flags, params );
+        --present_depth;
+        return hr;
     }
 
 
@@ -133,9 +164,12 @@ namespace ts_extra_utilities
             return false;
         }
 
-        present_hook = CCore::g_instance->get_hooks_manager()->register_virtual_function_hook(
+        // Inline-hook the Present function itself rather than swapping the pointer in the dummy's vtable:
+        // the game's swapchain (flip model, allow-tearing) can use a different vtable than this
+        // legacy-blt dummy, in which case a vtable swap never gets called.
+        present_hook = CCore::g_instance->get_hooks_manager()->register_function_hook(
             "dx11::present",
-            *reinterpret_cast< uint64_t* >( dummy_swap_chain ) + 0x08 * 8,
+            ( *reinterpret_cast< uint64_t** >( dummy_swap_chain ) )[ 8 ],
             reinterpret_cast< uint64_t >( &hk_present )
         );
 
@@ -143,6 +177,23 @@ namespace ts_extra_utilities
         {
             CCore::g_instance->error( "Could not hook dx11::present" );
             return false;
+        }
+
+        // Flip-model swapchains may be presented through IDXGISwapChain1::Present1 (vtable slot 22) instead.
+        // Optional: Present alone still covers games that never call it.
+        IDXGISwapChain1* dummy_swap_chain1 = nullptr;
+        if ( SUCCEEDED( dummy_swap_chain->QueryInterface( __uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&dummy_swap_chain1) ) ) )
+        {
+            present1_hook = CCore::g_instance->get_hooks_manager()->register_function_hook(
+                "dx11::present1",
+                ( *reinterpret_cast< uint64_t** >( dummy_swap_chain1 ) )[ 22 ],
+                reinterpret_cast< uint64_t >( &hk_present1 )
+            );
+            if ( present1_hook->hook() != CHook::HOOKED )
+            {
+                CCore::g_instance->error( "Could not hook dx11::present1" );
+            }
+            dummy_swap_chain1->Release();
         }
 
         dummy_swap_chain->Release();
@@ -157,6 +208,10 @@ namespace ts_extra_utilities
     {
         SetWindowLongPtr( prism_hwnd, GWLP_WNDPROC, reinterpret_cast< LONG_PTR >( original_wndproc ) );
 
-        return present_hook->unhook() == CHook::UNHOOKED;
+        if ( present1_hook != nullptr )
+        {
+            present1_hook->unhook();
+        }
+        return present_hook->unhook() == CHook::CREATED;
     }
 }

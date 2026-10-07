@@ -35,4 +35,6 @@ Download the [latest release](https://github.com/dariowouters/ts-extra-utilities
 (if the plugins folder does not exists, you can create one)
 
 Then in-game you can toggle the UI with `delete` and `insert` to toggle the cursor.  
-(Keybinds are currently hardcoded, will make it changable at some point.)
+All keys can be changed in the Keybinds window (click an action, press a key; Esc cancels). Steering
+hotkeys (steer left / right, center, lock / unlock) are unbound by default. Settings are saved to
+`%APPDATA%\ts-extra-utilities\settings.ini`.

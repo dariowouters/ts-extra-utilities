@@ -1,35 +1,28 @@
-﻿#pragma once
+#pragma once
 #include <cstdint>
 
 #include "window.hpp"
 #include "prism/functions.hpp"
 
-namespace prism
-{
-    class game_trailer_actor_u;
-}
-
 namespace ts_extra_utilities
 {
-    // TODO: get dynamic offsets for game_trailer_actor, slave_trailer, wheel_steering_stuff
-    // TODO: When disconnected: figure out 3rd person camera / trailer cables / disable lights / etc...
+    // Only manual trailer steering is ported to 1.61. Individually detachable trailers and
+    // lockable joints depend on many more struct offsets and vfunc slots that have not been
+    // re-verified, so they are disabled rather than left in a state that writes to stale offsets.
     class CTrailerManipulation : public CWindow
     {
     private:
         bool valid_ = false;
-        prism::set_individual_steering_fn* set_individual_steering_fn_ = nullptr;
-        prism::physics_trailer_u_get_slave_hook_position_fn* get_slave_hook_position_fn_ = nullptr;
 
-        void render_trailer_steering( prism::game_trailer_actor_u* current_trailer, uint32_t i ) const;
-        void connect_trailer( prism::game_trailer_actor_u* current_trailer, uint32_t i ) const;
-        void render_trailer_joint( prism::game_trailer_actor_u* current_trailer, uint32_t i ) const;
-        void render_trailers() const;
+        void render_trailer_steering( uint32_t i ) const;
 
     public:
         CTrailerManipulation();
         ~CTrailerManipulation() override;
 
         bool init() override;
+        // every frame, also while the window is hidden: refreshes the trailer chain and applies steering hotkeys
+        void update( float dt );
         void render() override;
     };
 }
