@@ -18,7 +18,13 @@ namespace ts_extra_utilities
 
     HRESULT hk_get_device_data( IDirectInputDevice8W* device, DWORD cb_object_data, LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdw_in_out, DWORD dw_flags )
     {
+        const detour_call_guard_t detour_guard;
         const auto result = get_device_data_hook->get_original< get_device_data_fn >()( device, cb_object_data, rgdod, pdw_in_out, dw_flags );
+
+        if ( g_shutting_down.load( std::memory_order_acquire ) || CCore::g_instance == nullptr )
+        {
+            return result;
+        }
 
         DIDEVICEINSTANCEW instance;
         instance.dwSize = sizeof( DIDEVICEINSTANCEW );

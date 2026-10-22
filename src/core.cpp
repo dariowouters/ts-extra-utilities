@@ -10,12 +10,19 @@
 
 #include "managers/window_manager.hpp"
 #include "windows/trailer_manipulation.hpp"
+#include "windows/keybinds.hpp"
+#include "settings/settings.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler( HWND, UINT, WPARAM, LPARAM );
+
+namespace ts_extra_utilities { void ts_shutdown_mark( const char* step ); }
 
 namespace ts_extra_utilities
 {
     CCore* CCore::g_instance = nullptr;
+
+    std::atomic< bool > g_shutting_down{ false };
+    std::atomic< int > g_detour_depth{ 0 };
 
     CCore::CCore( const scs_telemetry_init_params_v101_t* init_params ) : init_params_( init_params )
     {
@@ -29,6 +36,7 @@ namespace ts_extra_utilities
     {
         this->destroy();
         MH_RemoveHook( nullptr );
+        g_instance = nullptr;
     }
 
     bool CCore::init()
@@ -48,21 +56,29 @@ namespace ts_extra_utilities
             return false;
         }
 
-        const auto trailer_manipulation = this->window_manager_->register_window( std::make_shared< CTrailerManipulation >() );
+        settings::load();
 
-        if ( !trailer_manipulation->init() )
+        this->trailer_manipulation_ = this->window_manager_->register_window( std::make_shared< CTrailerManipulation >() );
+
+        if ( !this->trailer_manipulation_->init() )
         {
             g_instance->error( "Could not initialize the trailer manipulation module" );
         }
+
+        this->window_manager_->register_window( std::make_shared< CKeybinds >() )->init();
 
         return true;
     }
 
     void CCore::destroy()
     {
+        ts_shutdown_mark( "destroy: dx11_hook" );
         delete this->dx11_hook;
+        ts_shutdown_mark( "destroy: di8_hook" );
         delete this->di8_hook;
+        ts_shutdown_mark( "destroy: hooks_manager" );
         delete this->hooks_manager_;
+        ts_shutdown_mark( "destroy: window_manager" );
         delete this->window_manager_;
     }
 
@@ -89,6 +105,11 @@ namespace ts_extra_utilities
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
+        if ( this->trailer_manipulation_ != nullptr )
+        {
+            this->trailer_manipulation_->update( ImGui::GetIO().DeltaTime );
+        }
+
         if ( this->render_ui )
         {
 #ifdef _DEBUG
@@ -109,8 +130,9 @@ namespace ts_extra_utilities
         auto& io = ImGui::GetIO();
         if ( this->disable_in_game_mouse )
         {
-            io.MousePos.x = last_mouse_pos_x_;
-            io.MousePos.y = last_mouse_pos_y_;
+            // release the cursor at the center of the screen, then leave it free
+            io.MousePos.x = io.DisplaySize.x * 0.5f;
+            io.MousePos.y = io.DisplaySize.y * 0.5f;
         }
         else
         {
@@ -128,19 +150,25 @@ namespace ts_extra_utilities
         this->render_ui = !this->render_ui;
     }
 
-    // TODO: add keybind settings
     bool CCore::on_wnd_proc( HWND hwnd, UINT umsg, WPARAM wparam, LPARAM lparam )
     {
-        if ( umsg == WM_KEYDOWN )
+        if ( umsg == WM_KEYDOWN || umsg == WM_SYSKEYDOWN )
         {
-            if ( wparam == VK_INSERT )
+            const auto vk = static_cast< UINT >( wparam );
+            if ( settings::capture_key( vk ) )
             {
-                toggle_input_hook();
                 return true;
             }
-            if ( wparam == VK_DELETE )
+
+            const bool repeat = ( lparam & ( 1 << 30 ) ) != 0; // held down: toggle once, not on every auto-repeat
+            if ( vk == settings::key( settings::Action::TOGGLE_CURSOR ) )
             {
-                toggle_ui();
+                if ( !repeat ) toggle_input_hook();
+                return true;
+            }
+            if ( vk == settings::key( settings::Action::TOGGLE_UI ) )
+            {
+                if ( !repeat ) toggle_ui();
                 return true;
             }
         }
@@ -162,12 +190,19 @@ namespace ts_extra_utilities
     prism::base_ctrl_u* CCore::get_base_ctrl_instance()
     {
         if ( this->base_ctrl_instance_ptr_address != 0 ) return *reinterpret_cast< prism::base_ctrl_u** >( this->base_ctrl_instance_ptr_address );
+        if ( this->base_ctrl_scan_failed_ ) return nullptr;
 
-        const auto addr = memory::get_address_for_pattern( "48 8b 05 ? ? ? ? 48 8b 4b ? 48 8b 80 ? ? ? ? 48 8b b9" );
+        // 1.61: the `cheat repair` handler loads the game singleton and its game_actor back to back
+        const auto addr = memory::get_address_for_pattern( "48 8b 3d ? ? ? ? 48 8b bf ? ? ? ? 48 8b 5f 18 48 8b 9b" );
 
-        if ( addr == 0 ) return nullptr;
+        if ( addr == 0 )
+        {
+            this->base_ctrl_scan_failed_ = true;
+            this->error( "Could not find base_ctrl, trailer steering is unavailable" );
+            return nullptr;
+        }
         this->base_ctrl_instance_ptr_address = addr + *reinterpret_cast< int32_t* >( addr + 3 ) + 7;
-        this->game_actor_offset_in_base_ctrl = *reinterpret_cast< int32_t* >( addr + 14 );
+        this->game_actor_offset_in_base_ctrl = *reinterpret_cast< int32_t* >( addr + 10 );
 
         this->info( "Found base_ctrl @ +{:x}", memory::as_offset( this->base_ctrl_instance_ptr_address ) );
 

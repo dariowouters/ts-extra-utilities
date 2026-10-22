@@ -2,11 +2,12 @@
 
 #include <Windows.h>
 #include <d3d11.h>
+#include <dxgi1_2.h>
 
 #include "imgui.h"
 
 #include "core.hpp"
-#include "hooks/vtable_hook.hpp"
+#include "hooks/function_hook.hpp"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 
@@ -14,8 +15,10 @@ namespace ts_extra_utilities
 {
     using D3D11CreateDeviceAndSwapChain_fnt = decltype(D3D11CreateDeviceAndSwapChain);
     using present_fn = HRESULT __stdcall( IDXGISwapChain*, UINT, UINT );
+    using present1_fn = HRESULT __stdcall( IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS* );
 
-    std::shared_ptr< CVirtualFunctionHook > present_hook = nullptr;
+    std::shared_ptr< CFunctionHook > present_hook = nullptr;
+    std::shared_ptr< CFunctionHook > present1_hook = nullptr;
 
     bool imgui_initialized;
 
@@ -24,19 +27,46 @@ namespace ts_extra_utilities
     HWND prism_hwnd;
     WNDPROC original_wndproc;
 
+    extern void ts_shutdown_mark( const char* step );
+    extern void ts_note_present();
+    extern void ts_arm_exit_watchdog();
+
     LRESULT __stdcall WndProcD3D( HWND hwnd, UINT umsg, WPARAM wparam, LPARAM lparam )
     {
-        if ( CCore::g_instance->on_wnd_proc( hwnd, umsg, wparam, lparam ) ) return 0;
+        const detour_call_guard_t detour_guard;
+        // teardown observability: window destruction is the first close signal
+        // the plugin sees — scs_telemetry_shutdown may never run after this
+        if ( umsg == WM_DESTROY || umsg == WM_CLOSE )
+        {
+            ts_shutdown_mark( umsg == WM_DESTROY ? "WM_DESTROY on game window" : "WM_CLOSE on game window" );
+            ts_arm_exit_watchdog();
+        }
+        if ( !g_shutting_down.load( std::memory_order_acquire ) && CCore::g_instance != nullptr
+            && CCore::g_instance->on_wnd_proc( hwnd, umsg, wparam, lparam ) )
+        {
+            return 0;
+        }
         return CallWindowProc( original_wndproc, hwnd, umsg, wparam, lparam );
     }
 
-    HRESULT hk_present( IDXGISwapChain* swap_chain, const UINT sync_interval, const UINT flags )
+    // Shared by the Present and Present1 hooks. The depth counter keeps a frame from being
+    // drawn twice should one of them be implemented by calling the other.
+    thread_local int present_depth = 0;
+
+    void on_present( IDXGISwapChain* swap_chain )
     {
+        if ( present_depth++ != 0 )
+        {
+            return;
+        }
+
         if ( !imgui_initialized )
         {
             if ( SUCCEEDED( swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device)) ) )
             {
                 ImGui::CreateContext();
+                // fonte levemente maior para 4K (default 13px -> ~16px)
+                ImGui::GetIO().FontGlobalScale = 1.25f;
 
                 device->GetImmediateContext( &device_context );
 
@@ -51,12 +81,82 @@ namespace ts_extra_utilities
                     SetWindowLongPtr( prism_hwnd, GWLP_WNDPROC, reinterpret_cast< LONG_PTR >( WndProcD3D ) )
                 );
                 imgui_initialized = true;
+                CCore::g_instance->info( "Present hook is live, overlay initialized" );
+            }
+        }
+        else
+        {
+            // the game can recreate its device/swapchain on resolution change,
+            // alt+tab out of exclusive fullscreen, etc. — drawing with the stale
+            // device shows up as the overlay flickering, so re-init on change
+            ID3D11Device* current_device = nullptr;
+            if ( SUCCEEDED( swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&current_device)) )
+                && current_device != nullptr && current_device != device )
+            {
+                ImGui_ImplDX11_Shutdown();
+                ImGui_ImplWin32_Shutdown();
+
+                ID3D11Device* old_device = device;
+                ID3D11DeviceContext* old_context = device_context;
+                device = current_device;
+                device->GetImmediateContext( &device_context );
+                if ( old_context != nullptr ) old_context->Release();
+                if ( old_device != nullptr ) old_device->Release();
+
+                DXGI_SWAP_CHAIN_DESC desc;
+                swap_chain->GetDesc( &desc );
+                HWND new_hwnd = desc.OutputWindow;
+
+                ImGui_ImplWin32_Init( new_hwnd );
+                ImGui_ImplDX11_Init( device, device_context );
+                ImGui_ImplDX11_CreateDeviceObjects();
+
+                // re-hook the window proc only if the window is new or our hook
+                // was lost — storing WndProcD3D itself as "original" would recurse
+                if ( new_hwnd != prism_hwnd
+                    || GetWindowLongPtr( new_hwnd, GWLP_WNDPROC ) != reinterpret_cast< LONG_PTR >( WndProcD3D ) )
+                {
+                    WNDPROC prev = reinterpret_cast< WNDPROC >(
+                        SetWindowLongPtr( new_hwnd, GWLP_WNDPROC, reinterpret_cast< LONG_PTR >( WndProcD3D ) )
+                    );
+                    if ( prev != WndProcD3D ) original_wndproc = prev;
+                }
+                prism_hwnd = new_hwnd;
+                CCore::g_instance->info( "Game device changed, overlay re-initialized" );
+            }
+            else if ( current_device != nullptr )
+            {
+                current_device->Release();
             }
         }
 
-        CCore::g_instance->render();
+        // not a D3D11 swapchain otherwise, nothing to draw with
+        // shutdown: stop rendering the overlay — render() reads game state
+        // (trailer chain) that is being freed underneath us
+        if ( imgui_initialized && !g_shutting_down.load( std::memory_order_acquire ) && CCore::g_instance != nullptr )
+        {
+            CCore::g_instance->render();
+        }
+    }
 
-        return present_hook->get_original< present_fn >()( swap_chain, sync_interval, flags );
+    HRESULT hk_present( IDXGISwapChain* swap_chain, const UINT sync_interval, const UINT flags )
+    {
+        const detour_call_guard_t detour_guard;
+        ts_note_present();
+        on_present( swap_chain );
+        const auto hr = present_hook->get_original< present_fn >()( swap_chain, sync_interval, flags );
+        --present_depth;
+        return hr;
+    }
+
+    HRESULT hk_present1( IDXGISwapChain1* swap_chain, const UINT sync_interval, const UINT flags, const DXGI_PRESENT_PARAMETERS* params )
+    {
+        const detour_call_guard_t detour_guard;
+        ts_note_present();
+        on_present( swap_chain );
+        const auto hr = present1_hook->get_original< present1_fn >()( swap_chain, sync_interval, flags, params );
+        --present_depth;
+        return hr;
     }
 
 
@@ -133,9 +233,12 @@ namespace ts_extra_utilities
             return false;
         }
 
-        present_hook = CCore::g_instance->get_hooks_manager()->register_virtual_function_hook(
+        // Inline-hook the Present function itself rather than swapping the pointer in the dummy's vtable:
+        // the game's swapchain (flip model, allow-tearing) can use a different vtable than this
+        // legacy-blt dummy, in which case a vtable swap never gets called.
+        present_hook = CCore::g_instance->get_hooks_manager()->register_function_hook(
             "dx11::present",
-            *reinterpret_cast< uint64_t* >( dummy_swap_chain ) + 0x08 * 8,
+            ( *reinterpret_cast< uint64_t** >( dummy_swap_chain ) )[ 8 ],
             reinterpret_cast< uint64_t >( &hk_present )
         );
 
@@ -143,6 +246,23 @@ namespace ts_extra_utilities
         {
             CCore::g_instance->error( "Could not hook dx11::present" );
             return false;
+        }
+
+        // Flip-model swapchains may be presented through IDXGISwapChain1::Present1 (vtable slot 22) instead.
+        // Optional: Present alone still covers games that never call it.
+        IDXGISwapChain1* dummy_swap_chain1 = nullptr;
+        if ( SUCCEEDED( dummy_swap_chain->QueryInterface( __uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&dummy_swap_chain1) ) ) )
+        {
+            present1_hook = CCore::g_instance->get_hooks_manager()->register_function_hook(
+                "dx11::present1",
+                ( *reinterpret_cast< uint64_t** >( dummy_swap_chain1 ) )[ 22 ],
+                reinterpret_cast< uint64_t >( &hk_present1 )
+            );
+            if ( present1_hook->hook() != CHook::HOOKED )
+            {
+                CCore::g_instance->error( "Could not hook dx11::present1" );
+            }
+            dummy_swap_chain1->Release();
         }
 
         dummy_swap_chain->Release();
@@ -157,6 +277,10 @@ namespace ts_extra_utilities
     {
         SetWindowLongPtr( prism_hwnd, GWLP_WNDPROC, reinterpret_cast< LONG_PTR >( original_wndproc ) );
 
-        return present_hook->unhook() == CHook::UNHOOKED;
+        if ( present1_hook != nullptr )
+        {
+            present1_hook->unhook();
+        }
+        return present_hook->unhook() == CHook::CREATED;
     }
 }
